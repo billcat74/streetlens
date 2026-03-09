@@ -374,7 +374,7 @@ body{background:var(--ink);color:var(--white);font-family:'Syne',sans-serif;disp
     <div style="font-size:11px;color:var(--mist);line-height:1.7;margin-bottom:8px;">
       Deploy free at <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--sky);">workers.cloudflare.com</a> then paste the URL into ⚙ API Setup.
     </div>
-    <pre style="background:var(--ink);border:1px solid var(--line);border-radius:6px;padding:10px;font-family:'JetBrains Mono',monospace;font-size:8.5px;color:var(--emerald);overflow:auto;max-height:260px;line-height:1.6;">export default {
+    <pre style="background:var(--ink);border:1px solid var(--line);border-radius:6px;padding:10px;font-family:'JetBrains Mono',monospace;font-size:8.5px;color:var(--emerald);overflow:auto;max-height:320px;line-height:1.6;">export default {
   async fetch(request) {
     const ORIGIN = 'https://billcat74.github.io';
     const cors = {
@@ -389,35 +389,62 @@ body{background:var(--ink);color:var(--white);font-family:'Syne',sans-serif;disp
       return new Response('Not allowed', { status: 405 });
 
     try {
-      const { uploadUrl, imageBase64, mimeType } = await request.json();
+      const { oauthToken, endpoint, payload, imageBase64, mimeType }
+        = await request.json();
 
-      // Decode base64 → binary
+      const authHeader = { 'Authorization': 'Bearer ' + oauthToken };
+
+      // Step 1: get upload URL from Google
+      const startRes = await fetch(endpoint + ':startUpload', {
+        method: 'POST',
+        headers: authHeader,
+      });
+      if (!startRes.ok) {
+        const t = await startRes.text();
+        throw new Error('startUpload ' + startRes.status + ' ' + t);
+      }
+      const { uploadUrl } = await startRes.json();
+
+      // Step 2: PUT raw bytes directly to upload URL
       const bin = atob(imageBase64);
       const bytes = new Uint8Array(bin.length);
       for (let i = 0; i &lt; bin.length; i++) bytes[i] = bin.charCodeAt(i);
 
-      // PUT to Google with all required headers
-      const res = await fetch(uploadUrl, {
+      const putRes = await fetch(uploadUrl, {
         method: 'PUT',
         headers: {
           'Content-Type': mimeType || 'image/jpeg',
-          'Content-Length': bytes.byteLength.toString(),
           'X-Goog-Upload-Protocol': 'raw',
-          'X-Goog-Upload-Offset': '0',
         },
         body: bytes,
       });
+      if (!putRes.ok) {
+        const t = await putRes.text();
+        throw new Error('upload ' + putRes.status + ' ' + t);
+      }
 
-      // Return status + body so the app can show Google's error message
-      const body = await res.text();
+      // Step 3: create photo record
+      const fullPayload = Object.assign({}, payload,
+        { uploadReference: { uploadUrl } });
+      const createRes = await fetch(endpoint, {
+        method: 'POST',
+        headers: { ...authHeader, 'Content-Type': 'application/json' },
+        body: JSON.stringify(fullPayload),
+      });
+      if (!createRes.ok) {
+        const t = await createRes.text();
+        throw new Error('createPhoto ' + createRes.status + ' ' + t);
+      }
+      const photo = await createRes.json();
+
       return new Response(
-        JSON.stringify({ status: res.status, body: body }),
+        JSON.stringify({ ok: true, photoId: photo.photoId }),
         { headers: { ...cors, 'Content-Type': 'application/json' } }
       );
     } catch (err) {
       return new Response(
-        JSON.stringify({ status: 500, body: err.message }),
-        { headers: { ...cors, 'Content-Type': 'application/json' } }
+        JSON.stringify({ ok: false, error: err.message }),
+        { status: 200, headers: { ...cors, 'Content-Type': 'application/json' } }
       );
     }
   },
@@ -1093,48 +1120,49 @@ function startPublish(){
 }
 
 function pubAPI(photo){
-  var h={'Authorization':'Bearer '+S.svToken,'Content-Type':'application/json'};
+  var base64   = photo.dataUrl.split(',')[1];
+  var mimeType = photo.dataUrl.split(';')[0].split(':')[1] || 'image/jpeg';
+  var payload  = buildPayload(photo);
 
-  // Step 1: request upload URL
+  if(S.proxyUrl){
+    // Delegate ALL three steps to the Worker so the uploadUrl
+    // never touches the browser (avoids the one-time-URL 405 bug)
+    return fetch(S.proxyUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        oauthToken: S.svToken,
+        endpoint:   S.svEndpoint,
+        payload:    payload,
+        imageBase64: base64,
+        mimeType:   mimeType,
+      }),
+    })
+    .then(function(r){
+      if(!r.ok) throw new Error('Worker HTTP '+r.status);
+      return r.json();
+    })
+    .then(function(d){
+      if(!d.ok) throw new Error(d.error||'Unknown worker error');
+      photo.publishedId = d.photoId ? d.photoId.id : null;
+    });
+  }
+
+  // No proxy — direct flow (works on localhost only)
+  var h={'Authorization':'Bearer '+S.svToken,'Content-Type':'application/json'};
   return fetch(S.svEndpoint+':startUpload',{method:'POST',headers:h})
     .then(function(r){if(!r.ok)throw new Error('startUpload '+r.status);return r.json();})
     .then(function(data){
       var up=data.uploadUrl;
-
-      // Step 2: PUT image bytes — must go via proxy to avoid CORS block
-      var uploadProm;
-      if(S.proxyUrl){
-        // Send base64 to Cloudflare Worker which does the PUT server-side
-        var base64=photo.dataUrl.split(',')[1];
-        var mimeType=photo.dataUrl.split(';')[0].split(':')[1]||'image/jpeg';
-        uploadProm=fetch(S.proxyUrl,{
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({uploadUrl:up,imageBase64:base64,mimeType:mimeType}),
-        }).then(function(r){
-          if(!r.ok) throw new Error('proxy HTTP '+r.status);
-          return r.json();
-        }).then(function(d){
-          if(d.status&&d.status>=400)
-            throw new Error('Google upload '+d.status+(d.body?' — '+d.body.slice(0,120):''));
-        });
-      } else {
-        // No proxy — direct PUT (will work on localhost, fails on GitHub Pages due to CORS)
-        uploadProm=fetch(photo.dataUrl).then(function(r){return r.blob();})
-          .then(function(blob){
-            return fetch(up,{method:'PUT',headers:{'Content-Type':'image/jpeg','X-Goog-Upload-Protocol':'raw'},body:blob});
-          })
-          .then(function(r){if(!r.ok)throw new Error('upload '+r.status+' (add a proxy URL to fix CORS)');});
-      }
-
-      // Step 3 & 4: create photo record
-      return uploadProm.then(function(){
-        var pay=buildPayload(photo);
-        pay.uploadReference={uploadUrl:up};
-        return fetch(S.svEndpoint,{method:'POST',headers:h,body:JSON.stringify(pay)});
-      })
-      .then(function(r){if(!r.ok)throw new Error('createPhoto '+r.status);return r.json();})
-      .then(function(d){photo.publishedId=d.photoId?d.photoId.id:null;});
+      return fetch(photo.dataUrl).then(function(r){return r.blob();})
+        .then(function(blob){return fetch(up,{method:'PUT',headers:{'Content-Type':'image/jpeg','X-Goog-Upload-Protocol':'raw'},body:blob});})
+        .then(function(r){if(!r.ok)throw new Error('upload '+r.status+' — add a Proxy URL to fix CORS');})
+        .then(function(){
+          var pay=buildPayload(photo); pay.uploadReference={uploadUrl:up};
+          return fetch(S.svEndpoint,{method:'POST',headers:h,body:JSON.stringify(pay)});
+        })
+        .then(function(r){if(!r.ok)throw new Error('createPhoto '+r.status);return r.json();})
+        .then(function(d){photo.publishedId=d.photoId?d.photoId.id:null;});
     });
 }
 
