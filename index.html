@@ -1039,7 +1039,7 @@ function pubAPI(photo){
       var up=data.uploadUrl;
       const base64 = photo.dataUrl.split(',')[1];
 const mimeType = photo.dataUrl.split(';')[0].split(':')[1];
-return fetch('https://YOUR-WORKER.workers.dev', {
+return fetch('https://young-paper-b8bd.anthonybeal2002.workers.dev/', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ uploadUrl: up, imageBase64: base64, mimeType: mimeType }),
