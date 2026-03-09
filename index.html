@@ -1044,10 +1044,6 @@ return fetch('https://young-paper-b8bd.anthonybeal2002.workers.dev/', {
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ uploadUrl: up, imageBase64: base64, mimeType: mimeType }),
 });
-        .then(function(r){if(!r.ok)throw new Error('upload '+r.status);})
-        .then(function(){var pay=buildPayload(photo);pay.uploadReference={uploadUrl:up};return fetch(S.svEndpoint,{method:'POST',headers:h,body:JSON.stringify(pay)});})
-        .then(function(r){if(!r.ok)throw new Error('createPhoto '+r.status);return r.json();})
-        .then(function(d){photo.publishedId=d.photoId?d.photoId.id:null;});
     });
 }
 
