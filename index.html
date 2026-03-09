@@ -334,6 +334,14 @@ body{background:var(--ink);color:var(--white);font-family:'Syne',sans-serif;disp
     </div>
     <div class="fg"><label class="fl">Street View OAuth 2.0 Bearer Token</label><input class="fi" id="sv-token" type="password" placeholder="ya29…"></div>
     <div class="fg"><label class="fl">Publish Endpoint</label><input class="fi" id="sv-ep" type="text" value="https://streetviewpublish.googleapis.com/v1/photo"></div>
+    <div class="fg">
+      <label class="fl">Cloudflare Worker Proxy URL <span style="color:var(--fog);font-weight:400;">(fixes CORS on image upload)</span></label>
+      <input class="fi" id="proxy-url" type="text" placeholder="https://streetlens-upload.YOUR-NAME.workers.dev">
+    </div>
+    <div class="notice info" style="font-size:10px;margin-top:-4px;">
+      Without a proxy the image upload step will fail with a CORS error.
+      Deploy the free Cloudflare Worker from the <strong>Docs</strong> panel and paste its URL above.
+    </div>
     <div class="mfoot">
       <button class="mbtn" id="btn-api-cancel">Cancel</button>
       <button class="mbtn ok" id="btn-api-save">Save &amp; Apply</button>
@@ -362,6 +370,40 @@ body{background:var(--ink);color:var(--white);font-family:'Syne',sans-serif;disp
   "captureTime": { "seconds": 1704067200 },
   "connections": [{ "target": { "id": "photo_abc123" } }]
 }</pre>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:8px;color:var(--amber);letter-spacing:2px;text-transform:uppercase;margin-bottom:7px;margin-top:16px;">Cloudflare Worker — CORS Proxy</div>
+    <div style="font-size:11px;color:var(--mist);line-height:1.7;margin-bottom:8px;">
+      Deploy free at <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--sky);">workers.cloudflare.com</a> then paste the URL into ⚙ API Setup.
+    </div>
+    <pre style="background:var(--ink);border:1px solid var(--line);border-radius:6px;padding:10px;font-family:'JetBrains Mono',monospace;font-size:8.5px;color:var(--emerald);overflow:auto;max-height:210px;line-height:1.6;">export default {
+  async fetch(request) {
+    const ORIGIN = 'https://billcat74.github.io';
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: {
+        'Access-Control-Allow-Origin': ORIGIN,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      }});
+    }
+    if (request.method !== 'POST')
+      return new Response('Not allowed', { status: 405 });
+
+    const { uploadUrl, imageBase64, mimeType } = await request.json();
+    const bin = atob(imageBase64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i &lt; bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+    const res = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': mimeType || 'image/jpeg',
+                 'X-Goog-Upload-Protocol': 'raw' },
+      body: bytes,
+    });
+    return new Response(JSON.stringify({ status: res.status }), {
+      headers: { 'Content-Type': 'application/json',
+                 'Access-Control-Allow-Origin': ORIGIN },
+    });
+  },
+};</pre>
     <div class="mfoot"><button class="mbtn ok" id="btn-docs-close">Close</button></div>
   </div>
 </div>
@@ -378,6 +420,7 @@ var S = {
   selected:null, tool:'place', connectFrom:null,
   mapsKey:'', svToken:'',
   svEndpoint:'https://streetviewpublish.googleapis.com/v1/photo',
+  proxyUrl:'',
   // Slippy map state
   zoom:2, centerLat:20, centerLng:0,
   satellite:false,
@@ -1033,17 +1076,46 @@ function startPublish(){
 
 function pubAPI(photo){
   var h={'Authorization':'Bearer '+S.svToken,'Content-Type':'application/json'};
+
+  // Step 1: request upload URL
   return fetch(S.svEndpoint+':startUpload',{method:'POST',headers:h})
     .then(function(r){if(!r.ok)throw new Error('startUpload '+r.status);return r.json();})
     .then(function(data){
       var up=data.uploadUrl;
-      const base64 = photo.dataUrl.split(',')[1];
-const mimeType = photo.dataUrl.split(';')[0].split(':')[1];
-return fetch('https://young-paper-b8bd.anthonybeal2002.workers.dev/', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ uploadUrl: up, imageBase64: base64, mimeType: mimeType }),
-});
+
+      // Step 2: PUT image bytes — must go via proxy to avoid CORS block
+      var uploadProm;
+      if(S.proxyUrl){
+        // Send base64 to Cloudflare Worker which does the PUT server-side
+        var base64=photo.dataUrl.split(',')[1];
+        var mimeType=photo.dataUrl.split(';')[0].split(':')[1]||'image/jpeg';
+        uploadProm=fetch(S.proxyUrl,{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({uploadUrl:up,imageBase64:base64,mimeType:mimeType}),
+        }).then(function(r){
+          if(!r.ok) throw new Error('proxy upload '+r.status);
+          return r.json();
+        }).then(function(d){
+          if(d.status&&d.status>=400) throw new Error('proxy upload returned '+d.status);
+        });
+      } else {
+        // No proxy — direct PUT (will work on localhost, fails on GitHub Pages due to CORS)
+        uploadProm=fetch(photo.dataUrl).then(function(r){return r.blob();})
+          .then(function(blob){
+            return fetch(up,{method:'PUT',headers:{'Content-Type':'image/jpeg','X-Goog-Upload-Protocol':'raw'},body:blob});
+          })
+          .then(function(r){if(!r.ok)throw new Error('upload '+r.status+' (add a proxy URL to fix CORS)');});
+      }
+
+      // Step 3 & 4: create photo record
+      return uploadProm.then(function(){
+        var pay=buildPayload(photo);
+        pay.uploadReference={uploadUrl:up};
+        return fetch(S.svEndpoint,{method:'POST',headers:h,body:JSON.stringify(pay)});
+      })
+      .then(function(r){if(!r.ok)throw new Error('createPhoto '+r.status);return r.json();})
+      .then(function(d){photo.publishedId=d.photoId?d.photoId.id:null;});
     });
 }
 
@@ -1064,6 +1136,7 @@ function saveApiConfig(){
   S.mapsKey=document.getElementById('maps-key').value.trim();
   S.svToken=document.getElementById('sv-token').value.trim();
   S.svEndpoint=document.getElementById('sv-ep').value.trim()||S.svEndpoint;
+  S.proxyUrl=document.getElementById('proxy-url').value.trim();
   var chip=document.getElementById('api-chip');
   if(S.svToken){chip.className='chip chip-emerald';chip.innerHTML='<span class="chip-dot"></span> OAUTH READY';}
   else{chip.className='chip chip-amber';chip.innerHTML='<span class="chip-dot pulse"></span> DEMO MODE';}
