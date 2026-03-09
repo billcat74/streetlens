@@ -1037,8 +1037,13 @@ function pubAPI(photo){
     .then(function(r){if(!r.ok)throw new Error('startUpload '+r.status);return r.json();})
     .then(function(data){
       var up=data.uploadUrl;
-      return fetch(photo.dataUrl).then(function(r){return r.blob();})
-        .then(function(blob){return fetch(up,{method:'PUT',headers:{'Content-Type':'image/jpeg','X-Goog-Upload-Protocol':'raw'},body:blob});})
+      const base64 = photo.dataUrl.split(',')[1];
+const mimeType = photo.dataUrl.split(';')[0].split(':')[1];
+return fetch('https://YOUR-WORKER.workers.dev', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ uploadUrl: up, imageBase64: base64, mimeType: mimeType }),
+});
         .then(function(r){if(!r.ok)throw new Error('upload '+r.status);})
         .then(function(){var pay=buildPayload(photo);pay.uploadReference={uploadUrl:up};return fetch(S.svEndpoint,{method:'POST',headers:h,body:JSON.stringify(pay)});})
         .then(function(r){if(!r.ok)throw new Error('createPhoto '+r.status);return r.json();})
